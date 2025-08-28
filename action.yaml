@@ -1,9 +1,6 @@
 name: PR Slack Notifier
 description: Notify Slack channels when PRs are opened/updated
 inputs:
-  team_slug:
-    description: "GitHub team slug"
-    required: true
   config_json:
     description: "JSON string containing {channels, usergroups, users} (recommend passing from a secret)"
     required: true
@@ -14,290 +11,260 @@ inputs:
 runs:
   using: "composite"
   steps:
-    # --- REOPEN: if team requested, create/update message ---
-    - name: Determine if team is requested on reopen
-      id: check_on_open
+    #############################
+    # Helpers (bash functions)  #
+    #############################
+    - name: Prepare helpers
+      id: helpers
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/slack_helpers.sh <<'BASH'
+        set -euo pipefail
+
+        slack_token="${SLACK_TOKEN:?SLACK_TOKEN required}"
+        config_json="${CONFIG_JSON:?CONFIG_JSON required}"
+
+        # Look up channel for a given team slug; empty if none.
+        channel_for_team() {
+          local team="$1"
+          printf '%s' "$config_json" | jq -r --arg t "$team" '.channels[$t] // empty'
+        }
+
+        # Build team mention (subteam ping if configured, else plain @team)
+        mention_for_team() {
+          local team="$1"
+          local ug
+          ug=$(printf '%s' "$config_json" | jq -r --arg t "$team" '.usergroups[$t] // empty')
+          if [ -n "$ug" ]; then
+            printf '<!subteam^%s|@%s>' "$ug" "$team"
+          else
+            printf '@%s' "$team"
+          fi
+        }
+
+        # Mention for PR author (Slack ID if mapped; else @github_login)
+        mention_for_author() {
+          local gh_login="$1"
+          local sid
+          sid=$(printf '%s' "$config_json" | jq -r --arg g "$gh_login" '.users[$g] // empty')
+          if [ -n "$sid" ]; then
+            printf '<@%s>' "$sid"
+          else
+            printf '@%s' "$gh_login"
+          fi
+        }
+
+        # Post a message -> echoes Slack ts
+        slack_post() {
+          local channel="$1" text="$2"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $slack_token" \
+            -H "Content-type: application/json" \
+            --data "$(jq -nc --arg ch "$channel" --arg tx "$text" '{channel:$ch,text:$tx}')" \
+            https://slack.com/api/chat.postMessage
+        }
+
+        # Update a message given channel+ts
+        slack_update() {
+          local channel="$1" ts="$2" text="$3"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $slack_token" \
+            -H "Content-type: application/json" \
+            --data "$(jq -nc --arg ch "$channel" --arg ts "$ts" --arg tx "$text" '{channel:$ch,ts:$ts,text:$tx}')" \
+            https://slack.com/api/chat.update
+        }
+
+        # Read all existing slack-ts labels -> lines: "<team_slug> <ts>"
+        read_existing_ts_labels() {
+          gh api /repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels \
+          | jq -r '.[]?.name | select(startswith("slack-ts:"))' \
+          | awk -F: '{ team=$2; ts=$3; if (team!="" && ts!="") print team, ts }'
+        }
+
+        # Get existing ts for a specific team (empty if none)
+        ts_for_team() {
+          local team="$1"
+          local line
+          while read -r t ts; do
+            if [ "$t" = "$team" ]; then
+              printf '%s' "$ts"; return
+            fi
+          done < <(read_existing_ts_labels)
+        }
+
+        # Store a ts label for team (creates or adds label). Label form: slack-ts:<team>:<ts>
+        store_ts_label() {
+          local team="$1" ts="$2"
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            /repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels \
+            -f labels[]="slack-ts:${team}:${ts}" >/dev/null
+        }
+        BASH
+        echo "ok=1" >> "$GITHUB_OUTPUT"
+
+    ########################################
+    # REVIEW REQUESTED: one team per event #
+    ########################################
+    - name: Handle review_requested (post/update per team)
+      if: ${{ github.event_name == 'pull_request' && github.event.action == 'review_requested' }}
+      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
+        CONFIG_JSON: ${{ inputs.config_json }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        source /tmp/slack_helpers.sh
+
+        team="${{ github.event.requested_team.slug }}"
+        channel="$(channel_for_team "$team")"
+        if [ -z "$channel" ]; then
+          echo "No channel configured for team '$team'; skipping."
+          exit 0
+        fi
+
+        team_mention="$(mention_for_team "$team")"
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        pr_url="${{ github.event.pull_request.html_url }}"
+        pr_title="${{ github.event.pull_request.title }}"
+        label_text="${repo_name}: ${pr_title}"
+        text=":gh-opened: <${pr_url}|${label_text}> is waiting for review from ${team_mention}"
+
+        # Update if we already have a message, otherwise post and store ts.
+        existing_ts="$(ts_for_team "$team" || true)"
+        if [ -n "$existing_ts" ]; then
+          resp="$(slack_update "$channel" "$existing_ts" "$text")"
+          ok=$(printf '%s' "$resp" | jq -r '.ok')
+          [ "$ok" = "true" ] || { echo "Slack update failed: $resp" >&2; exit 1; }
+        else
+          resp="$(slack_post "$channel" "$text")"
+          ok=$(printf '%s' "$resp" | jq -r '.ok')
+          ts=$(printf '%s' "$resp" | jq -r '.ts')
+          [ "$ok" = "true" ] && [ -n "$ts" ] && [ "$ts" != "null" ] || { echo "Slack post failed: $resp" >&2; exit 1; }
+          store_ts_label "$team" "$ts"
+        fi
+
+    ########################################
+    # REOPENED: possibly multiple teams    #
+    ########################################
+    - name: Handle reopened (post/update for all requested teams with config)
       if: ${{ github.event_name == 'pull_request' && github.event.action == 'reopened' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        # Use the event payload to see if our team is already requested
-        if jq -e --arg slug "${{ inputs.team_slug }}" '.pull_request.requested_teams[]?.slug == $slug' "$GITHUB_EVENT_PATH" > /dev/null; then
-          echo "requested=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "requested=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Find existing Slack ts label (reopen)
-      id: findts_open
-      if: ${{ steps.check_on_open.outputs.requested == 'true' }}
       env:
-        GH_TOKEN: ${{ github.token }}
-      shell: bash
-      run: |
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        LABELS=$(gh api /repos/${{ github.repository }}/issues/$PR_NUMBER/labels)
-        TS=$(printf '%s' "$LABELS" | jq -r '.[]?.name | select(startswith("slack-ts:")) | sub("^slack-ts:";"")' | head -n1)
-        echo "ts=$TS" >> "$GITHUB_OUTPUT"
-
-    - name: Compose open message (reopen)
-      id: compose_open_from_opened
-      if: ${{ steps.check_on_open.outputs.requested == 'true' }}
-      shell: bash
-      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
         CONFIG_JSON: ${{ inputs.config_json }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      shell: bash
       run: |
         set -euo pipefail
-        TEAM="${{ inputs.team_slug }}"
-        CHANNEL_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.channels[$t] // empty')
-        [ -n "$CHANNEL_ID" ] || { echo "Missing channels[$TEAM] in config_json"; exit 1; }
+        source /tmp/slack_helpers.sh
 
-        UG_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.usergroups[$t] // empty')
-        if [ -n "$UG_ID" ]; then
-          TEAM_MENTION="<!subteam^${UG_ID}|@${TEAM}>"
-        else
-          TEAM_MENTION="@${TEAM}"
+        # Build array of requested team slugs from payload
+        mapfile -t teams < <(jq -r '.pull_request.requested_teams[]?.slug' "$GITHUB_EVENT_PATH")
+        if [ "${#teams[@]}" -eq 0 ]; then
+          echo "No requested teams on reopen; nothing to do."; exit 0
         fi
 
-        REPO_NAME="${GITHUB_REPOSITORY#*/}"
-        PR_URL="${{ github.event.pull_request.html_url }}"
-        PR_TITLE="${{ github.event.pull_request.title }}"
-        AUTHOR_LOGIN="${{ github.event.pull_request.user.login }}"
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        pr_url="${{ github.event.pull_request.html_url }}"
+        pr_title="${{ github.event.pull_request.title }}"
+        author_login="${{ github.event.pull_request.user.login }}"
+        author_mention="$(mention_for_author "$author_login")"
+        label_text="${repo_name}: ${pr_title}"
 
-        AUTHOR_SID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg g "$AUTHOR_LOGIN" '.users[$g] // empty')
-        if [ -n "$AUTHOR_SID" ]; then
-          AUTHOR_MENTION="<@${AUTHOR_SID}>"
-        else
-          AUTHOR_MENTION="@${AUTHOR_LOGIN}"
-        fi
+        for team in "${teams[@]}"; do
+          channel="$(channel_for_team "$team")"
+          if [ -z "$channel" ]; then
+            echo "Skipping team '$team' (no channel configured)."
+            continue
+          fi
+          team_mention="$(mention_for_team "$team")"
+          text=":gh-opened: <${pr_url}|${label_text}> is waiting for review from ${team_mention} — ${author_mention}"
 
-        LABEL="${REPO_NAME}: ${PR_TITLE}"
-        TEXT=":gh-opened: <${PR_URL}|${LABEL}> is waiting for review from ${TEAM_MENTION} — ${AUTHOR_MENTION}"
+          existing_ts="$(ts_for_team "$team" || true)"
+          if [ -n "$existing_ts" ]; then
+            resp="$(slack_update "$channel" "$existing_ts" "$text")"
+            ok=$(printf '%s' "$resp" | jq -r '.ok')
+            [ "$ok" = "true" ] || { echo "Slack update failed ($team): $resp" >&2; exit 1; }
+          else
+            resp="$(slack_post "$channel" "$text")"
+            ok=$(printf '%s' "$resp" | jq -r '.ok')
+            ts=$(printf '%s' "$resp" | jq -r '.ts')
+            [ "$ok" = "true" ] && [ -n "$ts" ] && [ "$ts" != "null" ] || { echo "Slack post failed ($team): $resp" >&2; exit 1; }
+            store_ts_label "$team" "$ts"
+          fi
+        done
 
-        echo "channel_id=$CHANNEL_ID" >> "$GITHUB_OUTPUT"
-        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
-
-    - name: Post Slack (reopen, no existing ts)
-      id: slack_open_from_opened
-      if: ${{ steps.check_on_open.outputs.requested == 'true' && steps.findts_open.outputs.ts == '' }}
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
-        method: chat.postMessage
-        token: ${{ inputs.slack_token }}
-        payload: |
-          {
-            "channel": "${{ steps.compose_open_from_opened.outputs.channel_id }}",
-            "text": "${{ steps.compose_open_from_opened.outputs.text }}"
-          }
-
-    - name: Store Slack ts on PR label (reopen, no existing ts)
-      if: ${{ steps.check_on_open.outputs.requested == 'true' && steps.findts_open.outputs.ts == '' && steps.slack_open_from_opened.outputs.response != '' }}
-      env:
-        GH_TOKEN: ${{ github.token }}
-        RESP: ${{ steps.slack_open_from_opened.outputs.response }}
-      shell: bash
-      run: |
-        TS=$(printf '%s' "$RESP" | jq -r '.ts')
-        [ -n "$TS" ] && [ "$TS" != "null" ] || { echo "Failed to get Slack ts"; exit 1; }
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        gh api -X POST -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/issues/$PR_NUMBER/labels \
-          -f labels[]="slack-ts:${TS}"
-
-    - name: Update Slack (reopen, existing ts)
-      if: ${{ steps.check_on_open.outputs.requested == 'true' && steps.findts_open.outputs.ts != '' }}
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
-        method: chat.update
-        token: ${{ inputs.slack_token }}
-        payload: |
-          {
-            "channel": "${{ steps.compose_open_from_opened.outputs.channel_id }}",
-            "ts": "${{ steps.findts_open.outputs.ts }}",
-            "text": "${{ steps.compose_open_from_opened.outputs.text }}"
-          }
-
-    # --- REVIEW REQUESTED: create message when team is added later ---
-    - name: Compose open message (review_requested path)
-      id: compose_open
-      if: ${{ github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_team.slug == inputs.team_slug }}
-      shell: bash
-      env:
-        CONFIG_JSON: ${{ inputs.config_json }}
-      run: |
-        set -euo pipefail
-        TEAM="${{ inputs.team_slug }}"
-        CHANNEL_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.channels[$t] // empty')
-        [ -n "$CHANNEL_ID" ] || { echo "Missing channels[$TEAM] in config_json"; exit 1; }
-
-        UG_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.usergroups[$t] // empty')
-        if [ -n "$UG_ID" ]; then
-          TEAM_MENTION="<!subteam^${UG_ID}|@${TEAM}>"
-        else
-          TEAM_MENTION="@${TEAM}"
-        fi
-
-        REPO_NAME="${GITHUB_REPOSITORY#*/}"
-        PR_URL="${{ github.event.pull_request.html_url }}"
-        PR_TITLE="${{ github.event.pull_request.title }}"
-        AUTHOR_LOGIN="${{ github.event.pull_request.user.login }}"
-
-        AUTHOR_SID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg g "$AUTHOR_LOGIN" '.users[$g] // empty')
-        if [ -n "$AUTHOR_SID" ]; then
-          AUTHOR_MENTION="<@${AUTHOR_SID}>"
-        else
-          AUTHOR_MENTION="@${AUTHOR_LOGIN}"
-        fi
-
-        LABEL="${REPO_NAME}: ${PR_TITLE}"
-        TEXT=":gh-opened: <${PR_URL}|${LABEL}> is waiting for review from ${TEAM_MENTION} — ${AUTHOR_MENTION}"
-
-        echo "channel_id=$CHANNEL_ID" >> "$GITHUB_OUTPUT"
-        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
-
-    - name: Post Slack (review_requested)
-      id: slack_open
-      if: ${{ steps.compose_open.outputs.text != '' }}
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
-        method: chat.postMessage
-        token: ${{ inputs.slack_token }}
-        payload: |
-          {
-            "channel": "${{ steps.compose_open.outputs.channel_id }}",
-            "text": "${{ steps.compose_open.outputs.text }}"
-          }
-
-    - name: Store Slack ts on PR label (review_requested)
-      if: ${{ steps.slack_open.outputs.response != '' }}
-      env:
-        GH_TOKEN: ${{ github.token }}
-        RESP: ${{ steps.slack_open.outputs.response }}
-      shell: bash
-      run: |
-        TS=$(printf '%s' "$RESP" | jq -r '.ts')
-        [ -n "$TS" ] && [ "$TS" != "null" ] || { echo "Failed to get Slack ts"; exit 1; }
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        gh api -X POST -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/issues/$PR_NUMBER/labels \
-          -f labels[]="slack-ts:${TS}"
-
-    # --- REVIEW SUBMITTED: approved / changes requested / commented ---
-    - name: Find Slack ts label (review)
-      id: findts_review
+    ##############################################################
+    # REVIEW SUBMITTED: update ALL team messages for this PR     #
+    ##############################################################
+    - name: Update Slack on review submit (approved / changes requested / commented)
       if: ${{ github.event_name == 'pull_request_review' && github.event.action == 'submitted' }}
       env:
-        GH_TOKEN: ${{ github.token }}
-      shell: bash
-      run: |
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        LABELS=$(gh api /repos/${{ github.repository }}/issues/$PR_NUMBER/labels)
-        TS=$(printf '%s' "$LABELS" | jq -r '.[]?.name | select(startswith("slack-ts:")) | sub("^slack-ts:";"")' | head -n1)
-        echo "ts=$TS" >> "$GITHUB_OUTPUT"
-
-    - name: Compose review message
-      id: compose_review
-      if: ${{ github.event_name == 'pull_request_review' && github.event.action == 'submitted' && steps.findts_review.outputs.ts != '' }}
-      shell: bash
-      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
         CONFIG_JSON: ${{ inputs.config_json }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      shell: bash
       run: |
         set -euo pipefail
-        TEAM="${{ inputs.team_slug }}"
-        CHANNEL_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.channels[$t] // empty')
-        [ -n "$CHANNEL_ID" ] || { echo "Missing channels[$TEAM] in config_json"; exit 1; }
+        source /tmp/slack_helpers.sh
 
-        REPO_NAME="${GITHUB_REPOSITORY#*/}"
-        PR_URL="${{ github.event.pull_request.html_url }}"
-        PR_TITLE="${{ github.event.pull_request.title }}"
-        STATE="${{ github.event.review.state }}"
-        AUTHOR_LOGIN="${{ github.event.pull_request.user.login }}"
+        state="${{ github.event.review.state }}"
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        pr_url="${{ github.event.pull_request.html_url }}"
+        pr_title="${{ github.event.pull_request.title }}"
+        author_login="${{ github.event.pull_request.user.login }}"
+        author_mention="$(mention_for_author "$author_login")"
+        label_text="${repo_name}: ${pr_title}"
 
-        AUTHOR_SID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg g "$AUTHOR_LOGIN" '.users[$g] // empty')
-        if [ -n "$AUTHOR_SID" ]; then
-          AUTHOR_MENTION="<@${AUTHOR_SID}>"
-        else
-          AUTHOR_MENTION="@${AUTHOR_LOGIN}"
-        fi
-
-        case "$STATE" in
-          approved|APPROVED)
-            EMOJI=":gh-approved:"; MSG="is ready to merge" ;;
-          changes_requested|CHANGES_REQUESTED)
-            EMOJI=":gh-requested-changes:"; MSG="has requested changes" ;;
-          commented|COMMENTED|dismissed|DISMISSED|pending|PENDING)
-            EMOJI=":gh-reviewed:"; MSG="was reviewed" ;;
-          *)
-            EMOJI=":gh-reviewed:"; MSG="was reviewed" ;;
+        case "$state" in
+          approved|APPROVED)          emoji=":gh-approved:";        msg="is ready to merge" ;;
+          changes_requested|CHANGES_REQUESTED) emoji=":gh-requested-changes:"; msg="has requested changes" ;;
+          commented|COMMENTED|dismissed|DISMISSED|pending|PENDING) emoji=":gh-reviewed:"; msg="was reviewed" ;;
+          *)                          emoji=":gh-reviewed:";        msg="was reviewed" ;;
         esac
 
-        LABEL="${REPO_NAME}: ${PR_TITLE}"
-        TEXT="${EMOJI} <${PR_URL}|${LABEL}> ${MSG} — ${AUTHOR_MENTION}"
+        # For every stored team label -> update the matching channel
+        while read -r team ts; do
+          channel="$(channel_for_team "$team")"
+          [ -n "$channel" ] || { echo "No channel for team '$team' (label exists) – skipping."; continue; }
+          text="${emoji} <${pr_url}|${label_text}> ${msg} — ${author_mention}"
+          resp="$(slack_update "$channel" "$ts" "$text")"
+          ok=$(printf '%s' "$resp" | jq -r '.ok')
+          [ "$ok" = "true" ] || { echo "Slack update failed ($team): $resp" >&2; exit 1; }
+        done < <(read_existing_ts_labels)
 
-        echo "channel_id=$CHANNEL_ID" >> "$GITHUB_OUTPUT"
-        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
-
-    - name: Update Slack (review)
-      if: ${{ steps.compose_review.outputs.text != '' }}
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
-        method: chat.update
-        token: ${{ inputs.slack_token }}
-        payload: |
-          {
-            "channel": "${{ steps.compose_review.outputs.channel_id }}",
-            "ts": "${{ steps.findts_review.outputs.ts }}",
-            "text": "${{ steps.compose_review.outputs.text }}"
-          }
-
-    # --- CLOSED / MERGED ---
-    - name: Find Slack ts label (close)
-      id: findts_close
+    ##################################
+    # CLOSED (merged or not merged)  #
+    ##################################
+    - name: Update Slack on close/merge
       if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' }}
       env:
-        GH_TOKEN: ${{ github.token }}
-      shell: bash
-      run: |
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        LABELS=$(gh api /repos/${{ github.repository }}/issues/$PR_NUMBER/labels)
-        TS=$(printf '%s' "$LABELS" | jq -r '.[]?.name | select(startswith("slack-ts:")) | sub("^slack-ts:";"")' | head -n1)
-        echo "ts=$TS" >> "$GITHUB_OUTPUT"
-
-    - name: Compose closed/merged message
-      id: compose_close
-      if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && steps.findts_close.outputs.ts != '' }}
-      shell: bash
-      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
         CONFIG_JSON: ${{ inputs.config_json }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      shell: bash
       run: |
         set -euo pipefail
-        TEAM="${{ inputs.team_slug }}"
-        CHANNEL_ID=$(printf '%s' "$CONFIG_JSON" | jq -r --arg t "$TEAM" '.channels[$t] // empty')
-        [ -n "$CHANNEL_ID" ] || { echo "Missing channels[$TEAM] in config_json"; exit 1; }
+        source /tmp/slack_helpers.sh
 
-        REPO_NAME="${GITHUB_REPOSITORY#*/}"
-        PR_URL="${{ github.event.pull_request.html_url }}"
-        PR_TITLE="${{ github.event.pull_request.title }}"
+        merged="${{ github.event.pull_request.merged }}"
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        pr_url="${{ github.event.pull_request.html_url }}"
+        pr_title="${{ github.event.pull_request.title }}"
+        label_text="${repo_name}: ${pr_title}"
 
-        LABEL="${REPO_NAME}: ${PR_TITLE}"
-        if [ "${{ github.event.pull_request.merged }}" = "true" ]; then
-          TEXT=":gh-merged: <${PR_URL}|${LABEL}> was merged"
+        if [ "$merged" = "true" ]; then
+          emoji=":gh-merged:"; msg="was merged"
         else
-          TEXT=":gh-closed: <${PR_URL}|${LABEL}> was closed"
+          emoji=":gh-closed:"; msg="was closed"
         fi
 
-        echo "channel_id=$CHANNEL_ID" >> "$GITHUB_OUTPUT"
-        echo "text=${TEXT}" >> "$GITHUB_OUTPUT"
-
-    - name: Update Slack (close)
-      if: ${{ steps.compose_close.outputs.text != '' }}
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
-        method: chat.update
-        token: ${{ inputs.slack_token }}
-        payload: |
-          {
-            "channel": "${{ steps.compose_close.outputs.channel_id }}",
-            "ts": "${{ steps.findts_close.outputs.ts }}",
-            "text": "${{ steps.compose_close.outputs.text }}"
-          }
+        while read -r team ts; do
+          channel="$(channel_for_team "$team")"
+          [ -n "$channel" ] || { echo "No channel for team '$team' (label exists) – skipping."; continue; }
+          text="${emoji} <${pr_url}|${label_text}> ${msg}"
+          resp="$(slack_update "$channel" "$ts" "$text")"
+          ok=$(printf '%s' "$resp" | jq -r '.ok')
+          [ "$ok" = "true" ] || { echo "Slack update failed ($team): $resp" >&2; exit 1; }
+        done < <(read_existing_ts_labels)

@@ -24,7 +24,6 @@ jobs:
     steps:
       - uses: livekit/slack-notifier-action@main
         with:
-          team_slug: cs-devs
           config_json: ${{ secrets.SLACK_NOTIFY_CONFIG_JSON }}
           slack_token: ${{ secrets.SLACK_PR_NOTIFIER_TOKEN }}
 ```
