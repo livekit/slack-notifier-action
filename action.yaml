@@ -128,8 +128,9 @@ runs:
         team_mention="$(mention_for_team "$team")"
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title="${{ github.event.pull_request.title }}"
-        label_text="${repo_name}: ${pr_title}"
+        raw_title='${{ github.event.pull_request.title }}'
+        pr_title=$(printf '%s' "$raw_title" | jq -Rr @json | sed 's/^"//; s/"$//')
+        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sed 's/>/-/g')
         text=":gh-opened: <${pr_url}|${label_text}> is waiting for review from ${team_mention}"
 
         # Update if we already have a message, otherwise post and store ts.
@@ -169,10 +170,11 @@ runs:
 
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title="${{ github.event.pull_request.title }}"
+        raw_title='${{ github.event.pull_request.title }}'
+        pr_title=$(printf '%s' "$raw_title" | jq -Rr @json | sed 's/^"//; s/"$//')
         author_login="${{ github.event.pull_request.user.login }}"
         author_mention="$(mention_for_author "$author_login")"
-        label_text="${repo_name}: ${pr_title}"
+        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sed 's/>/-/g')
 
         for team in "${teams[@]}"; do
           channel="$(channel_for_team "$team")"
@@ -215,10 +217,11 @@ runs:
         state="${{ github.event.review.state }}"
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title="${{ github.event.pull_request.title }}"
+        raw_title='${{ github.event.pull_request.title }}'
+        pr_title=$(printf '%s' "$raw_title" | jq -Rr @json | sed 's/^"//; s/"$//')
         author_login="${{ github.event.pull_request.user.login }}"
         author_mention="$(mention_for_author "$author_login")"
-        label_text="${repo_name}: ${pr_title}"
+        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sed 's/>/-/g')
 
         case "$state" in
           approved|APPROVED)          emoji=":gh-approved:";        msg="is ready to merge" ;;
@@ -255,8 +258,9 @@ runs:
         merged="${{ github.event.pull_request.merged }}"
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title="${{ github.event.pull_request.title }}"
-        label_text="${repo_name}: ${pr_title}"
+        raw_title='${{ github.event.pull_request.title }}'
+        pr_title=$(printf '%s' "$raw_title" | jq -Rr @json | sed 's/^"//; s/"$//')
+        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sed 's/>/-/g')
 
         if [ "$merged" = "true" ]; then
           emoji=":gh-merged:"; msg="was merged"
