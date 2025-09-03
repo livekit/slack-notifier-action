@@ -27,19 +27,14 @@ runs:
         : "${PR_NUMBER:?PR_NUMBER required}"
 
         # ---- Sanitization helpers ----
-        # Slack link label cannot contain '|' or '>', and '<' often confuses parsing.
+        # Slack link label cannot contain '|' or '>' and '<' often confuses parsing.
         # Also flatten CR/LF to spaces and strip other control chars.
         sanitize_label() {
-          # stdin -> safe single-line label
-          tr '\r\n' '  ' \
-          | sed -E 's/[<>|]/-/g' \
-          | tr -d '\000' \
-          | awk '{
-              # remove other ASCII control chars except tab (9) which we convert to space
-              gsub(/\t/, " ");
-              gsub(/[\001-\010\013-\037\177]/, "");
-              print
-            }'
+          LC_ALL=C tr '\r\n' '  ' | sed -E 's/[<>|]/-/g' | tr -d '\000' | awk '{
+            gsub(/\t/, " ");
+            gsub(/[\001-\010\013-\037\177]/, "");
+            print
+          }'
         }
 
         # ---- Config lookups ----
