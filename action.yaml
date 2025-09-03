@@ -26,23 +26,27 @@ runs:
         config_json="${CONFIG_JSON:?CONFIG_JSON required}"
         : "${PR_NUMBER:?PR_NUMBER required}"
 
-        # ---- Escaping / sanitization helpers ----
-        # JSON-escape arbitrary text, then strip jq's surrounding quotes -> plain safe string
-        json_unquoted() {
-          jq -Rr @json | sed 's/^"//; s/"$//'
-        }
-        # Slack link label can't contain '|' or '>' and should be single-line
+        # ---- Sanitization helpers ----
+        # Slack link label cannot contain '|' or '>', and '<' often confuses parsing.
+        # Also flatten CR/LF to spaces and strip other control chars.
         sanitize_label() {
-          tr '\n' ' ' | sed -E 's/[>|]/-/g'
+          # stdin -> safe single-line label
+          tr '\r\n' '  ' \
+          | sed -E 's/[<>|]/-/g' \
+          | tr -d '\000' \
+          | awk '{
+              # remove other ASCII control chars except tab (9) which we convert to space
+              gsub(/\t/, " ");
+              gsub(/[\001-\010\013-\037\177]/, "");
+              print
+            }'
         }
 
         # ---- Config lookups ----
-        # Slack channel for a given GitHub team slug (empty if not configured)
         channel_for_team() {
           local team="$1"
           printf '%s' "$config_json" | jq -r --arg t "$team" '.channels[$t] // empty'
         }
-        # Slack usergroup mention for team if configured; else plain @team
         mention_for_team() {
           local team="$1"
           local ug
@@ -53,7 +57,6 @@ runs:
             printf '@%s' "$team"
           fi
         }
-        # Slack mention for PR author via users map; else @github_login text
         mention_for_author() {
           local gh_login="$1"
           local sid
@@ -65,7 +68,7 @@ runs:
           fi
         }
 
-        # ---- Slack API wrappers ----
+        # ---- Slack API wrappers (jq does the JSON escaping) ----
         slack_post() {
           local channel="$1" text="$2"
           curl -sS -X POST \
@@ -135,9 +138,8 @@ runs:
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
 
-        # Safe title & label
-        pr_title=$(printf '%s' "$PR_TITLE" | json_unquoted)
-        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sanitize_label)
+        # Build safe label from raw title (no pre-escaping)
+        label_text=$(printf '%s: %s' "$repo_name" "$PR_TITLE" | sanitize_label)
 
         text=":gh-opened: <${pr_url}|${label_text}> is waiting for review from ${team_mention} — ${author_mention}"
 
@@ -177,9 +179,8 @@ runs:
 
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title=$(printf '%s' "$PR_TITLE" | json_unquoted)
         author_mention="$(mention_for_author "${{ github.event.pull_request.user.login }}")"
-        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sanitize_label)
+        label_text=$(printf '%s: %s' "$repo_name" "$PR_TITLE" | sanitize_label)
 
         for team in "${teams[@]}"; do
           channel="$(channel_for_team "$team")"
@@ -222,9 +223,8 @@ runs:
         state="${{ github.event.review.state }}"
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title=$(printf '%s' "$PR_TITLE" | json_unquoted)
         author_mention="$(mention_for_author "${{ github.event.pull_request.user.login }}")"
-        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sanitize_label)
+        label_text=$(printf '%s: %s' "$repo_name" "$PR_TITLE" | sanitize_label)
 
         case "$state" in
           approved|APPROVED)                          emoji=":gh-approved:";          msg="is ready to merge" ;;
@@ -265,8 +265,7 @@ runs:
         merged="${{ github.event.pull_request.merged }}"
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url="${{ github.event.pull_request.html_url }}"
-        pr_title=$(printf '%s' "$PR_TITLE" | json_unquoted)
-        label_text=$(printf '%s: %s' "$repo_name" "$pr_title" | sanitize_label)
+        label_text=$(printf '%s: %s' "$repo_name" "$PR_TITLE" | sanitize_label)
 
         if [ "$merged" = "true" ]; then
           emoji=":gh-merged:"; msg="was merged"
