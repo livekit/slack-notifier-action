@@ -51,3 +51,29 @@ jobs:
    - Find the user ID for each username (e.g. `U01234567`)
 
 5. Update the secret `SLACK_NOTIFY_CONFIG_JSON` in our org settings with the updated JSON file, and update in 1password
+
+## Requiring a check before "ready to merge"
+
+By default, a PR shows as ready to merge after one approval. If the repo has
+another merge requirement that a check enforces (for example, a check that
+requires two human approvers on some PRs), pass the check run name:
+
+```yaml
+         - uses: livekit/slack-notifier-action@main
+           with:
+              config_json: ${{ secrets.SLACK_NOTIFY_CONFIG_JSON }}
+              slack_token: ${{ secrets.SLACK_PR_NOTIFIER_TOKEN }}
+              required_check: Two humans involved
+```
+
+The PR then shows as ready to merge only after the latest run of that check on
+the PR head succeeds. The check usually finishes after the review event, so
+also run the notifier when the check's workflow completes, and give the
+workflow `checks: read`:
+
+```yaml
+on:
+   workflow_run:
+      workflows: ["Two Human Requirement"]
+      types: [completed]
+```

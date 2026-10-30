@@ -7,6 +7,10 @@ inputs:
   slack_token:
     description: "Slack Bot User OAuth Token (xoxb-...)"
     required: true
+  required_check:
+    description: "Optional check run name that must pass before an approved PR shows as ready to merge"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -101,6 +105,20 @@ runs:
             -f labels[]="slack-ts:${team}:${ts}" >/dev/null
         }
 
+        # ---- Required check ----
+        # Passes when no check is required, or when the latest run of the
+        # required check on the PR head succeeded. A run in progress or a
+        # failed run does not pass.
+        required_check_passed() {
+          [ -z "${REQUIRED_CHECK:-}" ] && return 0
+          local sha conclusion
+          sha=$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          conclusion=$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" \
+            | jq -r --arg name "$REQUIRED_CHECK" \
+              '[.check_runs[] | select(.name == $name)] | sort_by(.started_at) | last | .conclusion // ""')
+          [ "$conclusion" = "success" ]
+        }
+
         # ---- PR state computation ----
         compute_pr_state() {
           local has_changes has_approval
@@ -111,7 +129,7 @@ runs:
 
           if [ "$has_changes" = "true" ]; then
             echo "changes_requested"
-          elif [ "$has_approval" = "true" ]; then
+          elif [ "$has_approval" = "true" ] && required_check_passed; then
             echo "approved"
           else
             echo "pending"
@@ -225,6 +243,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_TITLE: ${{ github.event.pull_request.title }}
         GH_TOKEN: ${{ github.token }}
+        REQUIRED_CHECK: ${{ inputs.required_check }}
       shell: bash
       run: |
         set -euo pipefail
@@ -232,9 +251,11 @@ runs:
 
         state="$(compute_pr_state)"
 
-        # Comments without verdict don't change state
+        # Comments without verdict don't change state. An approval while the
+        # required check has not passed also stays pending; the workflow_run
+        # step below updates the message when the check finishes.
         if [ "$state" = "pending" ]; then
-          echo "Review was a comment without verdict; no state change."
+          echo "No verdict, or the required check has not passed; no state change."
           exit 0
         fi
 
@@ -242,6 +263,57 @@ runs:
         pr_url="${{ github.event.pull_request.html_url }}"
         author_mention="$(mention_for_author "${{ github.event.pull_request.user.login }}")"
         label_text=$(printf '%s: %s' "$repo_name" "$PR_TITLE" | sanitize_label)
+
+        case "$state" in
+          approved)          emoji=":gh-approved:";          msg="is ready to merge" ;;
+          changes_requested) emoji=":gh-requested-changes:"; msg="has changes requested" ;;
+        esac
+
+        while read -r team ts; do
+          channel="$(channel_for_team "$team")"
+          if [ -z "$channel" ]; then
+            echo "No channel for team '$team' (label exists) – skipping."
+            continue
+          fi
+          text="${emoji} <${pr_url}|${label_text}> ${msg} — ${author_mention}"
+          resp="$(slack_update "$channel" "$ts" "$text")"
+          ok=$(printf '%s' "$resp" | jq -r '.ok')
+          [ "$ok" = "true" ] || { echo "Slack update failed ($team): $resp" >&2; exit 1; }
+        done < <(read_existing_ts_labels)
+
+    #########################################################################
+    # REQUIRED CHECK FINISHED: the check often reruns after a review, so    #
+    # the review step can read a stale result. Recompute when it finishes.  #
+    #########################################################################
+    - name: Update Slack on required check completion
+      if: ${{ github.event_name == 'workflow_run' && inputs.required_check != '' && github.event.workflow_run.pull_requests[0].number }}
+      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
+        CONFIG_JSON: ${{ inputs.config_json }}
+        PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        GH_TOKEN: ${{ github.token }}
+        REQUIRED_CHECK: ${{ inputs.required_check }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        source /tmp/slack_helpers.sh
+
+        pr_json=$(gh api "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+        if [ "$(printf '%s' "$pr_json" | jq -r '.state')" != "open" ]; then
+          echo "PR is not open; nothing to update."
+          exit 0
+        fi
+
+        state="$(compute_pr_state)"
+        if [ "$state" = "pending" ]; then
+          echo "PR is not ready; no state change."
+          exit 0
+        fi
+
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        pr_url=$(printf '%s' "$pr_json" | jq -r '.html_url')
+        author_mention="$(mention_for_author "$(printf '%s' "$pr_json" | jq -r '.user.login')")"
+        label_text=$(printf '%s: %s' "$repo_name" "$(printf '%s' "$pr_json" | jq -r '.title')" | sanitize_label)
 
         case "$state" in
           approved)          emoji=":gh-approved:";          msg="is ready to merge" ;;
@@ -311,6 +383,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_TITLE: ${{ github.event.pull_request.title }}
         GH_TOKEN: ${{ github.token }}
+        REQUIRED_CHECK: ${{ inputs.required_check }}
       shell: bash
       run: |
         set -euo pipefail
