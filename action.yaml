@@ -8,7 +8,7 @@ inputs:
     description: "Slack Bot User OAuth Token (xoxb-...)"
     required: true
   required_check:
-    description: "Optional check run name that must pass before an approved PR shows as ready to merge"
+    description: "Name of a check run that must pass before an approved PR shows as ready to merge. If empty, no check is required."
     required: false
     default: ""
 
