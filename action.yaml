@@ -305,20 +305,11 @@ runs:
         fi
 
         state="$(compute_pr_state)"
-        if [ "$state" = "pending" ]; then
-          echo "PR is not ready; no state change."
-          exit 0
-        fi
 
         repo_name="${GITHUB_REPOSITORY#*/}"
         pr_url=$(printf '%s' "$pr_json" | jq -r '.html_url')
         author_mention="$(mention_for_author "$(printf '%s' "$pr_json" | jq -r '.user.login')")"
         label_text=$(printf '%s: %s' "$repo_name" "$(printf '%s' "$pr_json" | jq -r '.title')" | sanitize_label)
-
-        case "$state" in
-          approved)          emoji=":gh-approved:";          msg="is ready to merge" ;;
-          changes_requested) emoji=":gh-requested-changes:"; msg="has changes requested" ;;
-        esac
 
         while read -r team ts; do
           channel="$(channel_for_team "$team")"
@@ -326,7 +317,13 @@ runs:
             echo "No channel for team '$team' (label exists) – skipping."
             continue
           fi
-          text="${emoji} <${pr_url}|${label_text}> ${msg} — ${author_mention}"
+          # Pending resets the message, so an earlier "ready to merge" does
+          # not stay after the check fails or an approval is dismissed.
+          case "$state" in
+            approved)          text=":gh-approved: <${pr_url}|${label_text}> is ready to merge — ${author_mention}" ;;
+            changes_requested) text=":gh-requested-changes: <${pr_url}|${label_text}> has changes requested — ${author_mention}" ;;
+            pending)           text=":gh-opened: <${pr_url}|${label_text}> is waiting for review from $(mention_for_team "$team") — ${author_mention}" ;;
+          esac
           resp="$(slack_update "$channel" "$ts" "$text")"
           ok=$(printf '%s' "$resp" | jq -r '.ok')
           [ "$ok" = "true" ] || { echo "Slack update failed ($team): $resp" >&2; exit 1; }
